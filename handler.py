@@ -1,12 +1,17 @@
-# MiniX Lane A worker (ticket 28): RunPod serverless + ComfyUI-GGUF.
+# MiniX Lane A worker (ticket 28): RunPod serverless + ComfyUI.
 # Contract (matches the app client): job input
 #   {prompt, width, height, steps, seed, model}
-#     model = a Hugging Face GGUF repo id (the app entry's link)
+#     model = a Hugging Face repo id (the app entry's link)
 #   -> {"images": ["<base64 png>"]}
+# Two model families, routed by the repo's contents:
+#   - GGUF repos (top-level .gguf): the Qwen-Image graph. The text
+#     encoder + VAE always come from the seed repo (family parts); the
+#     diffusion GGUF comes from the requested repo (Q4_K_M preferred).
+#   - SDXL repos (a standalone .safetensors checkpoint): the classic
+#     CheckpointLoaderSimple graph (workflow_sdxl_api.json), tuned for
+#     the Big Lust line (DPM2 ancestral + Karras, CFG 4.5).
 # Model files cache on the network volume (VOLUME_PATH, default
-# /runpod-volume) so cold starts after the first are fast. The text
-# encoder + VAE always come from the seed repo (they are family parts);
-# the diffusion GGUF comes from the requested repo (Q4_K_M preferred).
+# /runpod-volume) so cold starts after the first are fast.
 import base64
 import json
 import os
@@ -28,6 +33,10 @@ SEED_REPO = "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF"
 ALIASES = {"abenzerps/Qwen-Image-2.1-Uncensored-GGUF": SEED_REPO}
 ENCODER = "text_encoders/qwen3vl_8b_int8_convrot.safetensors"
 VAE = "vae/qwen_image_2.1_vae_bf16.safetensors"
+SDXL_NEGATIVE = (
+    "lowres, bad anatomy, bad hands, missing fingers, extra fingers, "
+    "blurry, deformed, watermark, text, logo, jpeg artifacts"
+)
 
 
 def hf_file(repo, path, dest_dir):
@@ -54,17 +63,35 @@ def repo_files(repo):
     return [s["rfilename"] for s in d.get("siblings", [])]
 
 
-def ensure_models(repo):
-    """Download (once) everything the graph needs; return unet file name."""
+def ensure_models(repo, files):
+    """Download (once) everything the GGUF graph needs; return unet name."""
     hf_file(SEED_REPO, ENCODER, os.path.join(MODELS, "text_encoders"))
     hf_file(SEED_REPO, VAE, os.path.join(MODELS, "vae"))
-    files = repo_files(repo)
     ggufs = [f for f in files if f.endswith(".gguf") and "/" not in f]
-    if not ggufs:
-        raise RuntimeError(f"repo {repo} has no top-level .gguf")
     pick = next((f for f in ggufs if "Q4_K_M" in f), ggufs[0])
     hf_file(repo, pick, os.path.join(MODELS, "diffusion_models"))
     return pick
+
+
+def sdxl_checkpoint(files):
+    """A standalone SDXL checkpoint is a .safetensors that is not one of
+    the diffusers-layout parts (unet/, text_encoder*/, vae/)."""
+    skip = ("text_encoders/", "text_encoder/", "text_encoder_2/",
+            "vae/", "unet/", "loras/")
+    cands = [f for f in files
+             if f.endswith(".safetensors") and not f.startswith(skip)]
+    return cands[0] if cands else None
+
+
+def ensure_sdxl(repo, files):
+    """Download (once) the SDXL checkpoint; return its file name."""
+    pick = sdxl_checkpoint(files)
+    if not pick:
+        raise RuntimeError(
+            f"repo {repo} has no top-level .gguf and no standalone "
+            ".safetensors checkpoint")
+    hf_file(repo, pick, os.path.join(MODELS, "checkpoints"))
+    return os.path.basename(pick)
 
 
 COMFY_MODELS = "/comfyui/models"
@@ -77,7 +104,8 @@ def link_into_comfy():
     2026-11-03 21:50, when ComfyUI rejected the prompt with every model
     list empty while the files sat complete on the volume. Link at job
     time, right before prompting."""
-    for sub in ("diffusion_models", "text_encoders", "vae", "loras"):
+    for sub in ("diffusion_models", "text_encoders", "vae", "loras",
+                "checkpoints"):
         src_dir = os.path.join(MODELS, sub)
         dst_dir = os.path.join(COMFY_MODELS, sub)
         if not os.path.isdir(src_dir):
@@ -121,17 +149,31 @@ def run_workflow(job_input):
     repo = job_input.get("model") or SEED_REPO
     repo = ALIASES.get(repo, repo)
 
-    unet_name = ensure_models(repo)
-    link_into_comfy()
-
-    with open(os.path.join(os.path.dirname(__file__), "workflow_api.json")) as f:
-        wf = json.load(f)
-    wf["1"]["inputs"]["unet_name"] = unet_name
-    wf["4"]["inputs"]["text"] = prompt
-    wf["7"]["inputs"]["width"] = width
-    wf["7"]["inputs"]["height"] = height
-    wf["9"]["inputs"]["steps"] = steps
-    wf["9"]["inputs"]["seed"] = seed
+    files = repo_files(repo)
+    here = os.path.dirname(__file__)
+    if any(f.endswith(".gguf") and "/" not in f for f in files):
+        unet_name = ensure_models(repo, files)
+        link_into_comfy()
+        with open(os.path.join(here, "workflow_api.json")) as f:
+            wf = json.load(f)
+        wf["1"]["inputs"]["unet_name"] = unet_name
+        wf["4"]["inputs"]["text"] = prompt
+        wf["7"]["inputs"]["width"] = width
+        wf["7"]["inputs"]["height"] = height
+        wf["9"]["inputs"]["steps"] = steps
+        wf["9"]["inputs"]["seed"] = seed
+    else:
+        ckpt_name = ensure_sdxl(repo, files)
+        link_into_comfy()
+        with open(os.path.join(here, "workflow_sdxl_api.json")) as f:
+            wf = json.load(f)
+        wf["1"]["inputs"]["ckpt_name"] = ckpt_name
+        wf["2"]["inputs"]["text"] = prompt
+        wf["3"]["inputs"]["text"] = SDXL_NEGATIVE
+        wf["4"]["inputs"]["width"] = width
+        wf["4"]["inputs"]["height"] = height
+        wf["5"]["inputs"]["steps"] = steps
+        wf["5"]["inputs"]["seed"] = seed
 
     r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
     r.raise_for_status()

@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import random
+import shutil
 import time
 import urllib.parse
 import urllib.request
@@ -90,7 +91,20 @@ def ensure_sdxl(repo, files):
         raise RuntimeError(
             f"repo {repo} has no top-level .gguf and no standalone "
             ".safetensors checkpoint")
-    hf_file(repo, pick, os.path.join(MODELS, "checkpoints"))
+    dest_dir = os.path.join(MODELS, "checkpoints")
+    dest = os.path.join(dest_dir, os.path.basename(pick))
+    if not (os.path.exists(dest) and os.path.getsize(dest) > 1_000_000):
+        if shutil.disk_usage(VOLUME).free < 7_500_000_000:
+            # The 20 GB volume cannot hold the Qwen cache and an SDXL
+            # checkpoint at once. The GGUF is a re-downloadable cache,
+            # so evict it to make room (it returns on the next GGUF job).
+            gguf_dir = os.path.join(MODELS, "diffusion_models")
+            if os.path.isdir(gguf_dir):
+                for name in os.listdir(gguf_dir):
+                    if name.endswith(".gguf"):
+                        print(f"evicting cached GGUF {name} for volume room")
+                        os.remove(os.path.join(gguf_dir, name))
+    hf_file(repo, pick, dest_dir)
     return os.path.basename(pick)
 
 

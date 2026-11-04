@@ -21,7 +21,11 @@ import runpod
 COMFY = "http://127.0.0.1:8188"
 VOLUME = os.environ.get("VOLUME_PATH", "/runpod-volume")
 MODELS = os.path.join(VOLUME, "models")
-SEED_REPO = "abenzerps/Qwen-Image-2.1-Uncensored-GGUF"
+SEED_REPO = "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF"
+# The original repo (abenzerps/Qwen-Image-2.1-Uncensored-GGUF) was renamed
+# by its author to a Turbo-quant repo on 2026-11-03; the name now resolves
+# to different weights. The mirror above preserves the original UC files.
+ALIASES = {"abenzerps/Qwen-Image-2.1-Uncensored-GGUF": SEED_REPO}
 ENCODER = "text_encoders/qwen3vl_8b_int8_convrot.safetensors"
 VAE = "vae/qwen_image_2.1_vae_bf16.safetensors"
 
@@ -85,6 +89,7 @@ def run_workflow(job_input):
     steps = max(8, min(50, int(job_input.get("steps", 28))))
     seed = int(job_input.get("seed", 0)) or random.randint(1, 2**31 - 1)
     repo = job_input.get("model") or SEED_REPO
+    repo = ALIASES.get(repo, repo)
 
     unet_name = ensure_models(repo)
 

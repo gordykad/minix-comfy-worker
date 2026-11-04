@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 \
 # ComfyUI (recent master carries Qwen-Image 2.1 / Qwen3-VL support) + GGUF nodes
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /comfyui && \
     cd /comfyui && pip install --no-cache-dir -r requirements.txt && \
-    git clone --depth 1 https://github.com/city96/ComfyUI-GGUF custom_nodes/ComfyUI-GGUF && \
+    git clone --depth 1 https://github.com/leejet/ComfyUI-GGUF custom_nodes/ComfyUI-GGUF && \
     pip install --no-cache-dir -r custom_nodes/ComfyUI-GGUF/requirements.txt
 
 RUN pip install --no-cache-dir runpod==1.7.9 requests

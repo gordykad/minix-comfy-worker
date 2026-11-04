@@ -67,7 +67,7 @@ def ensure_models(repo):
     return pick
 
 
-def wait_for_comfy(timeout=240):
+def wait_for_comfy(timeout=420):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
@@ -77,7 +77,13 @@ def wait_for_comfy(timeout=240):
         except requests.RequestException:
             pass
         time.sleep(2)
-    raise RuntimeError("ComfyUI did not come up")
+    tail = ""
+    try:
+        with open("/tmp/comfy.log") as f:
+            tail = f.read()[-1500:]
+    except OSError:
+        pass
+    raise RuntimeError(f"ComfyUI did not come up. Boot log tail: {tail}")
 
 
 def run_workflow(job_input):

@@ -10,6 +10,6 @@ if [ -d "$VOLUME/models" ]; then
   done
 fi
 cd /comfyui
-python3 main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch &
+python3 main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch 2>&1 | tee /tmp/comfy.log &
 cd /worker
 python3 handler.py

@@ -18,6 +18,15 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /comfyui && \
 
 RUN pip install --no-cache-dir runpod==1.7.9 requests
 
+# Pin the triton that matches torch 2.5.1. A newer triton dragged in by the
+# requirements above breaks `import torch` itself (infer_schema rejects a
+# list[int] stride annotation) - ComfyUI died on import on RunPod
+# 2026-11-03 before ever binding port 8188. Smoke-gate both imports here
+# so a bad combination fails THIS build, never the worker.
+RUN pip install --no-cache-dir "triton==3.1.0" && \
+    python3 -c "import torch; print('torch import OK', torch.__version__)" && \
+    cd /comfyui && python3 -c "import comfy.model_management; print('comfy import OK')"
+
 WORKDIR /worker
 COPY handler.py workflow_api.json start.sh ./
 RUN chmod +x start.sh

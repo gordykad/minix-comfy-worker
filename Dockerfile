@@ -31,6 +31,10 @@ RUN python3 -c "import torch; print('torch import OK', torch.__version__)" && \
     cd /comfyui && python3 -c "import comfy_kitchen; print('comfy-kitchen import OK')"
 
 WORKDIR /worker
-COPY handler.py workflow_api.json start.sh ./
+COPY handler.py workflow_api.json workflow_sdxl_api.json start.sh ./
+# Both workflow graphs must exist and parse, or the build fails here instead
+# of the worker failing a paid job at runtime (2026-11-04: the SDXL graph
+# was never COPYed, so every SDXL job died with ENOENT after its download).
+RUN python3 -c "import json; [json.load(open(f)) for f in ('workflow_api.json', 'workflow_sdxl_api.json')]; print('workflow graphs OK')"
 RUN chmod +x start.sh
 CMD ["/worker/start.sh"]

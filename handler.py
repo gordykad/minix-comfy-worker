@@ -67,6 +67,30 @@ def ensure_models(repo):
     return pick
 
 
+COMFY_MODELS = "/comfyui/models"
+
+
+def link_into_comfy():
+    """ComfyUI only sees its own models tree. start.sh links the volume
+    cache in at container boot, but files downloaded afterwards (the
+    first job on a fresh volume) never got linked - the exact failure of
+    2026-11-03 21:50, when ComfyUI rejected the prompt with every model
+    list empty while the files sat complete on the volume. Link at job
+    time, right before prompting."""
+    for sub in ("diffusion_models", "text_encoders", "vae", "loras"):
+        src_dir = os.path.join(MODELS, sub)
+        dst_dir = os.path.join(COMFY_MODELS, sub)
+        if not os.path.isdir(src_dir):
+            continue
+        os.makedirs(dst_dir, exist_ok=True)
+        for name in os.listdir(src_dir):
+            if name.endswith(".part"):
+                continue
+            dst = os.path.join(dst_dir, name)
+            if not os.path.exists(dst):
+                os.symlink(os.path.join(src_dir, name), dst)
+
+
 def wait_for_comfy(timeout=420):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -98,6 +122,7 @@ def run_workflow(job_input):
     repo = ALIASES.get(repo, repo)
 
     unet_name = ensure_models(repo)
+    link_into_comfy()
 
     with open(os.path.join(os.path.dirname(__file__), "workflow_api.json")) as f:
         wf = json.load(f)

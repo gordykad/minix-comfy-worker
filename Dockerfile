@@ -23,9 +23,12 @@ RUN pip install --no-cache-dir runpod==1.7.9 requests
 # infer_schema rejects - ComfyUI died on import on RunPod 2026-11-03
 # before ever binding port 8188 (an earlier triton drift broke plain
 # `import torch` the same night). Smoke-gate both imports here so a bad
-# combination fails THIS build, never the worker.
+# combination fails THIS build, never the worker. The gate targets
+# comfy_kitchen itself (the package whose op registration crashed):
+# importing comfy.model_management wholesale probes CUDA at module level
+# and cannot run on a GPU-less build runner.
 RUN python3 -c "import torch; print('torch import OK', torch.__version__)" && \
-    cd /comfyui && python3 -c "import comfy.model_management; print('comfy import OK')"
+    cd /comfyui && python3 -c "import comfy_kitchen; print('comfy-kitchen import OK')"
 
 WORKDIR /worker
 COPY handler.py workflow_api.json start.sh ./

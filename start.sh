@@ -4,7 +4,7 @@
 set -e
 VOLUME="${VOLUME_PATH:-/runpod-volume}"
 if [ -d "$VOLUME/models" ]; then
-  for sub in diffusion_models text_encoders vae loras checkpoints; do
+  for sub in diffusion_models text_encoders vae loras checkpoints ipadapter clip_vision insightface; do
     mkdir -p "$VOLUME/models/$sub" /comfyui/models/$sub
     cp -rs "$VOLUME/models/$sub/"* /comfyui/models/$sub/ 2>/dev/null || true
   done

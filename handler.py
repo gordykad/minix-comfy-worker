@@ -20,6 +20,7 @@
 # Comfy-Org's official workflow templates. The stock template negative
 # bans nudity outright; this lane's negative is quality-only.
 import base64
+import io
 import json
 import os
 import random
@@ -27,6 +28,7 @@ import shutil
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 
 import requests
 import runpod
@@ -67,6 +69,76 @@ def hf_file(repo, path, dest_dir):
                 f.write(chunk)
     os.rename(tmp, dest)
     return dest
+
+
+def hf_file_as(repo, path, dest):
+    """hf_file with an explicit destination path (the FaceID stack
+    hunts its files by exact names in specific model folders)."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    url = f"https://huggingface.co/{repo}/resolve/main/{path}"
+    tmp = dest + ".part"
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+    os.rename(tmp, dest)
+    return dest
+
+
+FACEID_REPO = "h94/IP-Adapter-FaceID"
+CLIPVISION_NAME = "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+BUFFALO_URL = ("https://github.com/deepinsight/insightface/releases/"
+               "download/v0.7/buffalo_l.zip")
+
+
+def ensure_faceid():
+    """Cache the SDXL FaceID stack on the volume (IP-Adapter FaceID
+    Plus V2 + its LoRA, the CLIP-ViT-H vision encoder, and the
+    InsightFace buffalo_l face-embedding pack, ~4.7 GB total). The
+    loader nodes hunt these by canonical file names, so destinations
+    are exact. Volume room comes from the Qwen GGUF cache if needed -
+    that family is dropped and its files are re-downloadable."""
+    need = 6_500_000_000
+    if shutil.disk_usage(VOLUME).free < need:
+        gguf_dir = os.path.join(MODELS, "diffusion_models")
+        if os.path.isdir(gguf_dir):
+            for name in os.listdir(gguf_dir):
+                if name.endswith(".gguf"):
+                    print(f"evicting cached GGUF {name} for FaceID room")
+                    try:
+                        os.remove(os.path.join(gguf_dir, name))
+                    except OSError:
+                        pass
+    hf_file_as(FACEID_REPO, "ip-adapter-faceid-plusv2_sdxl.bin",
+               os.path.join(MODELS, "ipadapter",
+                            "ip-adapter-faceid-plusv2_sdxl.bin"))
+    hf_file_as(FACEID_REPO, "ip-adapter-faceid-plusv2_sdxl_lora.safetensors",
+               os.path.join(MODELS, "loras",
+                            "ip-adapter-faceid-plusv2_sdxl_lora.safetensors"))
+    hf_file_as("h94/IP-Adapter", "models/image_encoder/model.safetensors",
+               os.path.join(MODELS, "clip_vision", CLIPVISION_NAME))
+    pack_dir = os.path.join(MODELS, "insightface", "models", "buffalo_l")
+    marker = os.path.join(pack_dir, "det_10g.onnx")
+    if not (os.path.exists(marker)
+            and os.path.getsize(marker) > 1_000_000):
+        os.makedirs(pack_dir, exist_ok=True)
+        with requests.get(BUFFALO_URL, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            blob = io.BytesIO()
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                blob.write(chunk)
+        blob.seek(0)
+        with zipfile.ZipFile(blob) as z:
+            for info in z.infolist():
+                base = os.path.basename(info.filename)
+                if base.endswith(".onnx"):
+                    with z.open(info) as src, \
+                            open(os.path.join(pack_dir, base),
+                                 "wb") as dst:
+                        shutil.copyfileobj(src, dst)
 
 
 def repo_files(repo):
@@ -301,7 +373,7 @@ def link_into_comfy():
     list empty while the files sat complete on the volume. Link at job
     time, right before prompting."""
     for sub in ("diffusion_models", "text_encoders", "vae", "loras",
-                "checkpoints"):
+                "checkpoints", "ipadapter", "clip_vision", "insightface"):
         src_dir = os.path.join(MODELS, sub)
         dst_dir = os.path.join(COMFY_MODELS, sub)
         if not os.path.isdir(src_dir):
@@ -360,9 +432,31 @@ def run_workflow(job_input):
         wf["9"]["inputs"]["seed"] = seed
     else:
         ckpt_name = ensure_sdxl(repo, files)
-        link_into_comfy()
-        with open(os.path.join(here, "workflow_sdxl_api.json")) as f:
-            wf = json.load(f)
+        ref_b64 = job_input.get("image")
+        if ref_b64:
+            # Face-lock path: a base64 reference portrait anchors the
+            # identity (IP-Adapter FaceID Plus V2) over the SDXL graph.
+            ensure_faceid()
+            link_into_comfy()
+            up = requests.post(
+                COMFY + "/upload/image",
+                files={"image": ("minix_face_ref.png",
+                                 base64.b64decode(ref_b64), "image/png")},
+                data={"overwrite": "true"}, timeout=60)
+            up.raise_for_status()
+            with open(os.path.join(here,
+                                   "workflow_sdxl_faceid_api.json")) as f:
+                wf = json.load(f)
+            wf["11"]["inputs"]["lora_strength"] = float(
+                job_input.get("face_lora_strength", 0.6))
+            wf["12"]["inputs"]["weight"] = float(
+                job_input.get("face_weight", 0.85))
+            wf["12"]["inputs"]["weight_faceidv2"] = float(
+                job_input.get("face_weight_v2", 1.2))
+        else:
+            link_into_comfy()
+            with open(os.path.join(here, "workflow_sdxl_api.json")) as f:
+                wf = json.load(f)
         wf["1"]["inputs"]["ckpt_name"] = ckpt_name
         wf["2"]["inputs"]["text"] = prompt
         wf["3"]["inputs"]["text"] = SDXL_NEGATIVE

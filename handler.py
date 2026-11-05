@@ -12,6 +12,13 @@
 #     the Big Lust line (DPM2 ancestral + Karras, CFG 4.5).
 # Model files cache on the network volume (VOLUME_PATH, default
 # /runpod-volume) so cold starts after the first are fast.
+#
+# Video (ticket 32): job input {kind: "video", prompt, image?, width,
+# height, frames, seed, lora?, lora_strength?} -> {"videos": [b64 mp4]}.
+# Wan 2.2 FP8 dual experts (T2V or I2V by whether an image is attached)
+# + lightx2v 4-step Lightning LoRAs, graphs mirrored node-for-node from
+# Comfy-Org's official workflow templates. The stock template negative
+# bans nudity outright; this lane's negative is quality-only.
 import base64
 import json
 import os
@@ -37,6 +44,12 @@ VAE = "vae/qwen_image_2.1_vae_bf16.safetensors"
 SDXL_NEGATIVE = (
     "lowres, bad anatomy, bad hands, missing fingers, extra fingers, "
     "blurry, deformed, watermark, text, logo, jpeg artifacts"
+)
+WAN_REPO = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+WAN_NEGATIVE = (
+    "blurry, distorted, warped anatomy, extra limbs, missing limbs, "
+    "static frame, frozen motion, low quality, worst quality, "
+    "jpeg artifacts, watermark, text, subtitles, flicker, morphing"
 )
 
 
@@ -106,6 +119,149 @@ def ensure_sdxl(repo, files):
                         os.remove(os.path.join(gguf_dir, name))
     hf_file(repo, pick, dest_dir)
     return os.path.basename(pick)
+
+
+def ensure_wan(flavor):
+    """Cache the Wan 2.2 stack for flavor ('t2v' or 'i2v').
+
+    Each flavor's two FP8 experts are ~14.3 GB apiece; the 50 GB
+    volume holds ONE flavor beside the image caches, so a flavor
+    switch evicts the other flavor's experts (plus Qwen GGUFs if
+    still tight) and re-downloads. Shared parts (umt5, VAE, and both
+    flavors' small Lightning LoRAs) stay cached."""
+    files = repo_files(WAN_REPO)
+
+    def find(base):
+        hits = [f for f in files if os.path.basename(f) == base]
+        if not hits:
+            raise RuntimeError(f"Wan repo is missing {base}")
+        return hits[0]
+
+    lora_v = "v1.1" if flavor == "t2v" else "v1"
+    want = [
+        (f"wan2.2_{flavor}_high_noise_14B_fp8_scaled.safetensors",
+         "diffusion_models"),
+        (f"wan2.2_{flavor}_low_noise_14B_fp8_scaled.safetensors",
+         "diffusion_models"),
+        (f"wan2.2_{flavor}_lightx2v_4steps_lora_{lora_v}_high_noise"
+         ".safetensors", "loras"),
+        (f"wan2.2_{flavor}_lightx2v_4steps_lora_{lora_v}_low_noise"
+         ".safetensors", "loras"),
+        ("umt5_xxl_fp8_e4m3fn_scaled.safetensors", "text_encoders"),
+        ("wan_2.1_vae.safetensors", "vae"),
+    ]
+    experts = [os.path.join(MODELS, sub, base) for base, sub in want[:2]]
+    cached = all(os.path.exists(p) and os.path.getsize(p) > 1_000_000
+                 for p in experts)
+    if not cached and shutil.disk_usage(VOLUME).free < 32_000_000_000:
+        other = "i2v" if flavor == "t2v" else "t2v"
+        dm = os.path.join(MODELS, "diffusion_models")
+        if os.path.isdir(dm):
+            for name in os.listdir(dm):
+                if name.startswith(f"wan2.2_{other}_") or \
+                        name.endswith(".gguf"):
+                    print(f"evicting {name} for Wan volume room")
+                    try:
+                        os.remove(os.path.join(dm, name))
+                    except OSError:
+                        pass
+    for base, sub in want:
+        hf_file(WAN_REPO, find(base), os.path.join(MODELS, sub))
+
+
+def run_video(job_input):
+    prompt = job_input.get("prompt", "").strip()
+    if not prompt:
+        raise RuntimeError("prompt is required")
+    image_b64 = job_input.get("image")
+    flavor = "i2v" if image_b64 else "t2v"
+    width = int(job_input.get("width", 832))
+    height = int(job_input.get("height", 480))
+    frames = int(job_input.get("frames", 81))
+    seed = int(job_input.get("seed", 0)) or random.randint(1, 2**31 - 1)
+
+    ensure_wan(flavor)
+
+    # Optional community LoRA (the explicit-content tuning layer): an
+    # HF repo id (first .safetensors wins) or "repo:filename".
+    lora_name = None
+    lora_ref = (job_input.get("lora") or "").strip()
+    if lora_ref:
+        if ":" in lora_ref and "/" in lora_ref.split(":")[0]:
+            lrepo, lfile = lora_ref.split(":", 1)
+        else:
+            lrepo, lfile = lora_ref, None
+        lfiles = repo_files(lrepo)
+        pick = lfile or next(
+            (f for f in lfiles if f.endswith(".safetensors")), None)
+        if not pick:
+            raise RuntimeError(f"lora repo {lrepo} has no .safetensors")
+        hf_file(lrepo, pick, os.path.join(MODELS, "loras"))
+        lora_name = os.path.basename(pick)
+    link_into_comfy()
+
+    here = os.path.dirname(__file__)
+    fname = ("workflow_wan_i2v_api.json" if flavor == "i2v"
+             else "workflow_wan_t2v_api.json")
+    with open(os.path.join(here, fname)) as f:
+        wf = json.load(f)
+    wf["8"]["inputs"]["text"] = prompt
+    wf["9"]["inputs"]["text"] = job_input.get("negative") or WAN_NEGATIVE
+    wf["12"]["inputs"]["noise_seed"] = seed
+    if flavor == "i2v":
+        up = requests.post(
+            COMFY + "/upload/image",
+            files={"image": ("minix_i2v_input.png",
+                             base64.b64decode(image_b64), "image/png")},
+            data={"overwrite": "true"}, timeout=60)
+        up.raise_for_status()
+        wf["17"]["inputs"]["width"] = width
+        wf["17"]["inputs"]["height"] = height
+        wf["17"]["inputs"]["length"] = frames
+    else:
+        wf["11"]["inputs"]["width"] = width
+        wf["11"]["inputs"]["height"] = height
+        wf["11"]["inputs"]["length"] = frames
+    if lora_name:
+        strength = float(job_input.get("lora_strength", 0.85))
+        for new_id, prev, nxt in (("18", "2", "3"), ("19", "5", "6")):
+            wf[new_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"model": [prev, 0], "lora_name": lora_name,
+                           "strength_model": strength},
+            }
+            wf[nxt]["inputs"]["model"] = [new_id, 0]
+
+    r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
+    r.raise_for_status()
+    prompt_id = r.json()["prompt_id"]
+
+    deadline = time.time() + 1200
+    while time.time() < deadline:
+        h = requests.get(COMFY + f"/history/{prompt_id}",
+                         timeout=15).json()
+        if prompt_id in h:
+            entry = h[prompt_id]
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"comfy execution error: {status}")
+            for node_out in entry.get("outputs", {}).values():
+                for key in ("images", "gifs", "videos"):
+                    for vid in node_out.get(key, []):
+                        fn = vid.get("filename", "")
+                        if fn.endswith((".mp4", ".webm")):
+                            q = urllib.parse.urlencode(
+                                {"filename": fn,
+                                 "subfolder": vid.get("subfolder", ""),
+                                 "type": vid.get("type", "output")})
+                            data = requests.get(
+                                COMFY + "/view?" + q, timeout=120).content
+                            return {"videos": [
+                                base64.b64encode(data).decode()],
+                                "seed": seed}
+            raise RuntimeError("workflow finished with no video output")
+        time.sleep(3)
+    raise RuntimeError("video generation timed out after 1200s")
 
 
 COMFY_MODELS = "/comfyui/models"
@@ -217,7 +373,10 @@ def run_workflow(job_input):
 
 def handler(job):
     try:
-        return run_workflow(job.get("input", {}))
+        job_input = job.get("input", {})
+        if job_input.get("kind") == "video":
+            return run_video(job_input)
+        return run_workflow(job_input)
     except Exception as e:  # honest failure back to the app
         return {"error": str(e)}
 

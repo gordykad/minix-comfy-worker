@@ -2,10 +2,6 @@
 # Contract (matches the app client): job input
 #   {prompt, width, height, steps, seed, model}
 #     model = a Hugging Face repo id (the app entry's link)
-#   Optional, SDXL path only:
-#     loras = [{repo, file, strength_model, strength_clip}, ...]
-#       chained LoraLoader nodes after the checkpoint, in order
-#     negative_extra = text appended to the built-in SDXL negative
 #   -> {"images": ["<base64 png>"]}
 # Two model families, routed by the repo's contents:
 #   - GGUF repos (top-level .gguf): the Qwen-Image graph. The text
@@ -14,9 +10,20 @@
 #   - SDXL repos (a standalone .safetensors checkpoint): the classic
 #     CheckpointLoaderSimple graph (workflow_sdxl_api.json), tuned for
 #     the Big Lust line (DPM2 ancestral + Karras, CFG 4.5).
+#   Optional, SDXL stills only: loras = [{repo, file, strength_model,
+#     strength_clip}, ...] chains LoraLoader nodes after the checkpoint;
+#     negative_extra appends to the built-in SDXL negative.
 # Model files cache on the network volume (VOLUME_PATH, default
 # /runpod-volume) so cold starts after the first are fast.
+#
+# Video (ticket 32): job input {kind: "video", prompt, image?, width,
+# height, frames, seed, lora?, lora_strength?} -> {"videos": [b64 mp4]}.
+# Wan 2.2 FP8 dual experts (T2V or I2V by whether an image is attached)
+# + lightx2v 4-step Lightning LoRAs, graphs mirrored node-for-node from
+# Comfy-Org's official workflow templates. The stock template negative
+# bans nudity outright; this lane's negative is quality-only.
 import base64
+import io
 import json
 import os
 import random
@@ -24,6 +31,7 @@ import shutil
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 
 import requests
 import runpod
@@ -42,6 +50,12 @@ SDXL_NEGATIVE = (
     "lowres, bad anatomy, bad hands, missing fingers, extra fingers, "
     "blurry, deformed, watermark, text, logo, jpeg artifacts"
 )
+WAN_REPO = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+WAN_NEGATIVE = (
+    "blurry, distorted, warped anatomy, extra limbs, missing limbs, "
+    "static frame, frozen motion, low quality, worst quality, "
+    "jpeg artifacts, watermark, text, subtitles, flicker, morphing"
+)
 
 
 def hf_file(repo, path, dest_dir):
@@ -58,6 +72,76 @@ def hf_file(repo, path, dest_dir):
                 f.write(chunk)
     os.rename(tmp, dest)
     return dest
+
+
+def hf_file_as(repo, path, dest):
+    """hf_file with an explicit destination path (the FaceID stack
+    hunts its files by exact names in specific model folders)."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    url = f"https://huggingface.co/{repo}/resolve/main/{path}"
+    tmp = dest + ".part"
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+    os.rename(tmp, dest)
+    return dest
+
+
+FACEID_REPO = "h94/IP-Adapter-FaceID"
+CLIPVISION_NAME = "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+BUFFALO_URL = ("https://github.com/deepinsight/insightface/releases/"
+               "download/v0.7/buffalo_l.zip")
+
+
+def ensure_faceid():
+    """Cache the SDXL FaceID stack on the volume (IP-Adapter FaceID
+    Plus V2 + its LoRA, the CLIP-ViT-H vision encoder, and the
+    InsightFace buffalo_l face-embedding pack, ~4.7 GB total). The
+    loader nodes hunt these by canonical file names, so destinations
+    are exact. Volume room comes from the Qwen GGUF cache if needed -
+    that family is dropped and its files are re-downloadable."""
+    need = 6_500_000_000
+    if shutil.disk_usage(VOLUME).free < need:
+        gguf_dir = os.path.join(MODELS, "diffusion_models")
+        if os.path.isdir(gguf_dir):
+            for name in os.listdir(gguf_dir):
+                if name.endswith(".gguf"):
+                    print(f"evicting cached GGUF {name} for FaceID room")
+                    try:
+                        os.remove(os.path.join(gguf_dir, name))
+                    except OSError:
+                        pass
+    hf_file_as(FACEID_REPO, "ip-adapter-faceid-plusv2_sdxl.bin",
+               os.path.join(MODELS, "ipadapter",
+                            "ip-adapter-faceid-plusv2_sdxl.bin"))
+    hf_file_as(FACEID_REPO, "ip-adapter-faceid-plusv2_sdxl_lora.safetensors",
+               os.path.join(MODELS, "loras",
+                            "ip-adapter-faceid-plusv2_sdxl_lora.safetensors"))
+    hf_file_as("h94/IP-Adapter", "models/image_encoder/model.safetensors",
+               os.path.join(MODELS, "clip_vision", CLIPVISION_NAME))
+    pack_dir = os.path.join(MODELS, "insightface", "models", "buffalo_l")
+    marker = os.path.join(pack_dir, "det_10g.onnx")
+    if not (os.path.exists(marker)
+            and os.path.getsize(marker) > 1_000_000):
+        os.makedirs(pack_dir, exist_ok=True)
+        with requests.get(BUFFALO_URL, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            blob = io.BytesIO()
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                blob.write(chunk)
+        blob.seek(0)
+        with zipfile.ZipFile(blob) as z:
+            for info in z.infolist():
+                base = os.path.basename(info.filename)
+                if base.endswith(".onnx"):
+                    with z.open(info) as src, \
+                            open(os.path.join(pack_dir, base),
+                                 "wb") as dst:
+                        shutil.copyfileobj(src, dst)
 
 
 def repo_files(repo):
@@ -88,6 +172,199 @@ def sdxl_checkpoint(files):
     return cands[0] if cands else None
 
 
+def ensure_sdxl(repo, files):
+    """Download (once) the SDXL checkpoint; return its file name."""
+    pick = sdxl_checkpoint(files)
+    if not pick:
+        raise RuntimeError(
+            f"repo {repo} has no top-level .gguf and no standalone "
+            ".safetensors checkpoint")
+    dest_dir = os.path.join(MODELS, "checkpoints")
+    dest = os.path.join(dest_dir, os.path.basename(pick))
+    if not (os.path.exists(dest) and os.path.getsize(dest) > 1_000_000):
+        if shutil.disk_usage(VOLUME).free < 7_500_000_000:
+            # The 20 GB volume cannot hold the Qwen cache and an SDXL
+            # checkpoint at once. The GGUF is a re-downloadable cache,
+            # so evict it to make room (it returns on the next GGUF job).
+            gguf_dir = os.path.join(MODELS, "diffusion_models")
+            if os.path.isdir(gguf_dir):
+                for name in os.listdir(gguf_dir):
+                    if name.endswith(".gguf"):
+                        print(f"evicting cached GGUF {name} for volume room")
+                        os.remove(os.path.join(gguf_dir, name))
+    hf_file(repo, pick, dest_dir)
+    return os.path.basename(pick)
+
+
+def ensure_wan(flavor):
+    """Cache the Wan 2.2 stack for flavor ('t2v' or 'i2v').
+
+    Each flavor's two FP8 experts are ~14.3 GB apiece; the 50 GB
+    volume holds ONE flavor beside the image caches, so a flavor
+    switch evicts the other flavor's experts (plus Qwen GGUFs if
+    still tight) and re-downloads. Shared parts (umt5, VAE, and both
+    flavors' small Lightning LoRAs) stay cached."""
+    files = repo_files(WAN_REPO)
+
+    def find(base):
+        hits = [f for f in files if os.path.basename(f) == base]
+        if not hits:
+            raise RuntimeError(f"Wan repo is missing {base}")
+        return hits[0]
+
+    lora_v = "v1.1" if flavor == "t2v" else "v1"
+    want = [
+        (f"wan2.2_{flavor}_high_noise_14B_fp8_scaled.safetensors",
+         "diffusion_models"),
+        (f"wan2.2_{flavor}_low_noise_14B_fp8_scaled.safetensors",
+         "diffusion_models"),
+        (f"wan2.2_{flavor}_lightx2v_4steps_lora_{lora_v}_high_noise"
+         ".safetensors", "loras"),
+        (f"wan2.2_{flavor}_lightx2v_4steps_lora_{lora_v}_low_noise"
+         ".safetensors", "loras"),
+        ("umt5_xxl_fp8_e4m3fn_scaled.safetensors", "text_encoders"),
+        ("wan_2.1_vae.safetensors", "vae"),
+    ]
+    experts = [os.path.join(MODELS, sub, base) for base, sub in want[:2]]
+    cached = all(os.path.exists(p) and os.path.getsize(p) > 1_000_000
+                 for p in experts)
+    if not cached and shutil.disk_usage(VOLUME).free < 32_000_000_000:
+        other = "i2v" if flavor == "t2v" else "t2v"
+        dm = os.path.join(MODELS, "diffusion_models")
+        if os.path.isdir(dm):
+            for name in os.listdir(dm):
+                if name.startswith(f"wan2.2_{other}_") or \
+                        name.endswith(".gguf"):
+                    print(f"evicting {name} for Wan volume room")
+                    try:
+                        os.remove(os.path.join(dm, name))
+                    except OSError:
+                        pass
+    for base, sub in want:
+        hf_file(WAN_REPO, find(base), os.path.join(MODELS, sub))
+
+
+def run_video(job_input):
+    prompt = job_input.get("prompt", "").strip()
+    if not prompt:
+        raise RuntimeError("prompt is required")
+    image_b64 = job_input.get("image")
+    flavor = "i2v" if image_b64 else "t2v"
+    width = int(job_input.get("width", 832))
+    height = int(job_input.get("height", 480))
+    frames = int(job_input.get("frames", 81))
+    seed = int(job_input.get("seed", 0)) or random.randint(1, 2**31 - 1)
+
+    ensure_wan(flavor)
+
+    # Optional community LoRA (the explicit-content tuning layer): an
+    # HF repo id or "repo:filename". Wan NSFW LoRAs ship as expert
+    # PAIRS (a high-noise file and a low-noise file - e.g. lopi999's
+    # NSFW-22-H-e8 / NSFW-22-L-e8); when the repo names a pair, each
+    # file chains into its own expert. A lone file chains into both.
+    lora_high = lora_low = None
+    lora_ref = (job_input.get("lora") or "").strip()
+    if lora_ref:
+        if ":" in lora_ref and "/" in lora_ref.split(":")[0]:
+            lrepo, lfile = lora_ref.split(":", 1)
+        else:
+            lrepo, lfile = lora_ref, None
+        lfiles = repo_files(lrepo)
+        tensors = [f for f in lfiles if f.endswith(".safetensors")]
+        if lfile:
+            if lfile not in tensors:
+                raise RuntimeError(f"lora file {lfile} not in {lrepo}")
+            hf_file(lrepo, lfile, os.path.join(MODELS, "loras"))
+            lora_high = lora_low = os.path.basename(lfile)
+        else:
+            def _is_high(n):
+                n = n.lower()
+                return "high" in n or "-h-" in n or "_h_" in n \
+                    or n.endswith("-h.safetensors")
+            def _is_low(n):
+                n = n.lower()
+                return "low" in n or "-l-" in n or "_l_" in n \
+                    or n.endswith("-l.safetensors")
+            hi = next((f for f in tensors if _is_high(f)), None)
+            lo = next((f for f in tensors if _is_low(f)), None)
+            if hi and lo and hi != lo:
+                hf_file(lrepo, hi, os.path.join(MODELS, "loras"))
+                hf_file(lrepo, lo, os.path.join(MODELS, "loras"))
+                lora_high = os.path.basename(hi)
+                lora_low = os.path.basename(lo)
+            elif tensors:
+                hf_file(lrepo, tensors[0],
+                        os.path.join(MODELS, "loras"))
+                lora_high = lora_low = os.path.basename(tensors[0])
+            else:
+                raise RuntimeError(f"lora repo {lrepo} has no .safetensors")
+    link_into_comfy()
+
+    here = os.path.dirname(__file__)
+    fname = ("workflow_wan_i2v_api.json" if flavor == "i2v"
+             else "workflow_wan_t2v_api.json")
+    with open(os.path.join(here, fname)) as f:
+        wf = json.load(f)
+    wf["8"]["inputs"]["text"] = prompt
+    wf["9"]["inputs"]["text"] = job_input.get("negative") or WAN_NEGATIVE
+    wf["12"]["inputs"]["noise_seed"] = seed
+    if flavor == "i2v":
+        up = requests.post(
+            COMFY + "/upload/image",
+            files={"image": ("minix_i2v_input.png",
+                             base64.b64decode(image_b64), "image/png")},
+            data={"overwrite": "true"}, timeout=60)
+        up.raise_for_status()
+        wf["17"]["inputs"]["width"] = width
+        wf["17"]["inputs"]["height"] = height
+        wf["17"]["inputs"]["length"] = frames
+    else:
+        wf["11"]["inputs"]["width"] = width
+        wf["11"]["inputs"]["height"] = height
+        wf["11"]["inputs"]["length"] = frames
+    if lora_high:
+        strength = float(job_input.get("lora_strength", 0.85))
+        for new_id, prev, nxt, lname in (
+                ("18", "2", "3", lora_high), ("19", "5", "6", lora_low)):
+            wf[new_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"model": [prev, 0], "lora_name": lname,
+                           "strength_model": strength},
+            }
+            wf[nxt]["inputs"]["model"] = [new_id, 0]
+
+    r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
+    r.raise_for_status()
+    prompt_id = r.json()["prompt_id"]
+
+    deadline = time.time() + 1200
+    while time.time() < deadline:
+        h = requests.get(COMFY + f"/history/{prompt_id}",
+                         timeout=15).json()
+        if prompt_id in h:
+            entry = h[prompt_id]
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"comfy execution error: {status}")
+            for node_out in entry.get("outputs", {}).values():
+                for key in ("images", "gifs", "videos"):
+                    for vid in node_out.get(key, []):
+                        fn = vid.get("filename", "")
+                        if fn.endswith((".mp4", ".webm")):
+                            q = urllib.parse.urlencode(
+                                {"filename": fn,
+                                 "subfolder": vid.get("subfolder", ""),
+                                 "type": vid.get("type", "output")})
+                            data = requests.get(
+                                COMFY + "/view?" + q, timeout=120).content
+                            return {"videos": [
+                                base64.b64encode(data).decode()],
+                                "seed": seed}
+            raise RuntimeError("workflow finished with no video output")
+        time.sleep(3)
+    raise RuntimeError("video generation timed out after 1200s")
+
+
 def ensure_lora(spec):
     """Download (once) one LoRA file into the volume loras cache.
 
@@ -95,9 +372,8 @@ def ensure_lora(spec):
            "strength_model": float, "strength_clip": float}
     Returns the cached file's basename for the LoraLoader node.
     """
-    repo = spec["repo"]
-    path = spec["file"]
-    return hf_file(repo, path, os.path.join(MODELS, "loras"))
+    return hf_file(spec["repo"], spec["file"],
+                   os.path.join(MODELS, "loras"))
 
 
 def build_sdxl_lora_workflow(ckpt_name, lora_names, prompt, negative,
@@ -105,8 +381,9 @@ def build_sdxl_lora_workflow(ckpt_name, lora_names, prompt, negative,
     """The SDXL graph with a LoraLoader chain after the checkpoint.
 
     Same sampler recipe as workflow_sdxl_api.json (DPM 2 ancestral,
-    Karras, CFG 4.5); the only change is model+clip threading through
-    one LoraLoader per requested LoRA, in order.
+    Karras, CFG 4.5) and the same node ids for the shared slots; the
+    only change is model+clip threading through one LoraLoader per
+    requested LoRA, in order.
     """
     wf = {
         "1": {"class_type": "CheckpointLoaderSimple",
@@ -150,30 +427,6 @@ def build_sdxl_lora_workflow(ckpt_name, lora_names, prompt, negative,
     return wf
 
 
-def ensure_sdxl(repo, files):
-    """Download (once) the SDXL checkpoint; return its file name."""
-    pick = sdxl_checkpoint(files)
-    if not pick:
-        raise RuntimeError(
-            f"repo {repo} has no top-level .gguf and no standalone "
-            ".safetensors checkpoint")
-    dest_dir = os.path.join(MODELS, "checkpoints")
-    dest = os.path.join(dest_dir, os.path.basename(pick))
-    if not (os.path.exists(dest) and os.path.getsize(dest) > 1_000_000):
-        if shutil.disk_usage(VOLUME).free < 7_500_000_000:
-            # The 20 GB volume cannot hold the Qwen cache and an SDXL
-            # checkpoint at once. The GGUF is a re-downloadable cache,
-            # so evict it to make room (it returns on the next GGUF job).
-            gguf_dir = os.path.join(MODELS, "diffusion_models")
-            if os.path.isdir(gguf_dir):
-                for name in os.listdir(gguf_dir):
-                    if name.endswith(".gguf"):
-                        print(f"evicting cached GGUF {name} for volume room")
-                        os.remove(os.path.join(gguf_dir, name))
-    hf_file(repo, pick, dest_dir)
-    return os.path.basename(pick)
-
-
 COMFY_MODELS = "/comfyui/models"
 
 
@@ -185,7 +438,7 @@ def link_into_comfy():
     list empty while the files sat complete on the volume. Link at job
     time, right before prompting."""
     for sub in ("diffusion_models", "text_encoders", "vae", "loras",
-                "checkpoints"):
+                "checkpoints", "ipadapter", "clip_vision", "insightface"):
         src_dir = os.path.join(MODELS, sub)
         dst_dir = os.path.join(COMFY_MODELS, sub)
         if not os.path.isdir(src_dir):
@@ -244,34 +497,57 @@ def run_workflow(job_input):
         wf["9"]["inputs"]["seed"] = seed
     else:
         ckpt_name = ensure_sdxl(repo, files)
-        negative = SDXL_NEGATIVE
-        extra_neg = str(job_input.get("negative_extra") or "").strip()
-        if extra_neg:
-            negative = negative + ", " + extra_neg
-        lora_specs = job_input.get("loras") or []
-        if lora_specs:
-            lora_names = [ensure_lora(spec) for spec in lora_specs]
+        ref_b64 = job_input.get("image")
+        if ref_b64:
+            # Face-lock path: a base64 reference portrait anchors the
+            # identity (IP-Adapter FaceID Plus V2) over the SDXL graph.
+            ensure_faceid()
             link_into_comfy()
-            wf = build_sdxl_lora_workflow(
-                ckpt_name, lora_names, prompt, negative,
-                width, height, steps, seed, lora_specs)
-        else:
-            link_into_comfy()
-            with open(os.path.join(here, "workflow_sdxl_api.json")) as f:
+            up = requests.post(
+                COMFY + "/upload/image",
+                files={"image": ("minix_face_ref.png",
+                                 base64.b64decode(ref_b64), "image/png")},
+                data={"overwrite": "true"}, timeout=60)
+            up.raise_for_status()
+            with open(os.path.join(here,
+                                   "workflow_sdxl_faceid_api.json")) as f:
                 wf = json.load(f)
-            wf["1"]["inputs"]["ckpt_name"] = ckpt_name
-            wf["2"]["inputs"]["text"] = prompt
-            wf["3"]["inputs"]["text"] = negative
-            wf["4"]["inputs"]["width"] = width
-            wf["4"]["inputs"]["height"] = height
-            wf["5"]["inputs"]["steps"] = steps
-            wf["5"]["inputs"]["seed"] = seed
+            wf["11"]["inputs"]["lora_strength"] = float(
+                job_input.get("face_lora_strength", 0.6))
+            wf["12"]["inputs"]["weight"] = float(
+                job_input.get("face_weight", 0.85))
+            wf["12"]["inputs"]["weight_faceidv2"] = float(
+                job_input.get("face_weight_v2", 1.2))
+            negative = SDXL_NEGATIVE
+        else:
+            negative = SDXL_NEGATIVE
+            extra_neg = str(job_input.get("negative_extra") or "").strip()
+            if extra_neg:
+                negative = negative + ", " + extra_neg
+            lora_specs = job_input.get("loras") or []
+            if lora_specs:
+                lora_names = [ensure_lora(spec) for spec in lora_specs]
+                link_into_comfy()
+                wf = build_sdxl_lora_workflow(
+                    ckpt_name, lora_names, prompt, negative,
+                    width, height, steps, seed, lora_specs)
+            else:
+                link_into_comfy()
+                with open(os.path.join(here, "workflow_sdxl_api.json")) as f:
+                    wf = json.load(f)
+        wf["1"]["inputs"]["ckpt_name"] = ckpt_name
+        wf["2"]["inputs"]["text"] = prompt
+        wf["3"]["inputs"]["text"] = negative
+        wf["4"]["inputs"]["width"] = width
+        wf["4"]["inputs"]["height"] = height
+        wf["5"]["inputs"]["steps"] = steps
+        wf["5"]["inputs"]["seed"] = seed
 
     r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
     r.raise_for_status()
     prompt_id = r.json()["prompt_id"]
 
-    deadline = time.time() + 600
+    deadline = time.time() + 1200
     while time.time() < deadline:
         h = requests.get(COMFY + f"/history/{prompt_id}", timeout=15).json()
         if prompt_id in h:
@@ -290,12 +566,15 @@ def run_workflow(job_input):
                             "seed": seed}
             raise RuntimeError("workflow finished with no image output")
         time.sleep(2)
-    raise RuntimeError("generation timed out after 600s")
+    raise RuntimeError("generation timed out after 1200s")
 
 
 def handler(job):
     try:
-        return run_workflow(job.get("input", {}))
+        job_input = job.get("input", {})
+        if job_input.get("kind") == "video":
+            return run_video(job_input)
+        return run_workflow(job_input)
     except Exception as e:  # honest failure back to the app
         return {"error": str(e)}
 

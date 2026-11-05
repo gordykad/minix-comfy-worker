@@ -183,8 +183,11 @@ def run_video(job_input):
     ensure_wan(flavor)
 
     # Optional community LoRA (the explicit-content tuning layer): an
-    # HF repo id (first .safetensors wins) or "repo:filename".
-    lora_name = None
+    # HF repo id or "repo:filename". Wan NSFW LoRAs ship as expert
+    # PAIRS (a high-noise file and a low-noise file - e.g. lopi999's
+    # NSFW-22-H-e8 / NSFW-22-L-e8); when the repo names a pair, each
+    # file chains into its own expert. A lone file chains into both.
+    lora_high = lora_low = None
     lora_ref = (job_input.get("lora") or "").strip()
     if lora_ref:
         if ":" in lora_ref and "/" in lora_ref.split(":")[0]:
@@ -192,12 +195,34 @@ def run_video(job_input):
         else:
             lrepo, lfile = lora_ref, None
         lfiles = repo_files(lrepo)
-        pick = lfile or next(
-            (f for f in lfiles if f.endswith(".safetensors")), None)
-        if not pick:
-            raise RuntimeError(f"lora repo {lrepo} has no .safetensors")
-        hf_file(lrepo, pick, os.path.join(MODELS, "loras"))
-        lora_name = os.path.basename(pick)
+        tensors = [f for f in lfiles if f.endswith(".safetensors")]
+        if lfile:
+            if lfile not in tensors:
+                raise RuntimeError(f"lora file {lfile} not in {lrepo}")
+            hf_file(lrepo, lfile, os.path.join(MODELS, "loras"))
+            lora_high = lora_low = os.path.basename(lfile)
+        else:
+            def _is_high(n):
+                n = n.lower()
+                return "high" in n or "-h-" in n or "_h_" in n \
+                    or n.endswith("-h.safetensors")
+            def _is_low(n):
+                n = n.lower()
+                return "low" in n or "-l-" in n or "_l_" in n \
+                    or n.endswith("-l.safetensors")
+            hi = next((f for f in tensors if _is_high(f)), None)
+            lo = next((f for f in tensors if _is_low(f)), None)
+            if hi and lo and hi != lo:
+                hf_file(lrepo, hi, os.path.join(MODELS, "loras"))
+                hf_file(lrepo, lo, os.path.join(MODELS, "loras"))
+                lora_high = os.path.basename(hi)
+                lora_low = os.path.basename(lo)
+            elif tensors:
+                hf_file(lrepo, tensors[0],
+                        os.path.join(MODELS, "loras"))
+                lora_high = lora_low = os.path.basename(tensors[0])
+            else:
+                raise RuntimeError(f"lora repo {lrepo} has no .safetensors")
     link_into_comfy()
 
     here = os.path.dirname(__file__)
@@ -222,12 +247,13 @@ def run_video(job_input):
         wf["11"]["inputs"]["width"] = width
         wf["11"]["inputs"]["height"] = height
         wf["11"]["inputs"]["length"] = frames
-    if lora_name:
+    if lora_high:
         strength = float(job_input.get("lora_strength", 0.85))
-        for new_id, prev, nxt in (("18", "2", "3"), ("19", "5", "6")):
+        for new_id, prev, nxt, lname in (
+                ("18", "2", "3", lora_high), ("19", "5", "6", lora_low)):
             wf[new_id] = {
                 "class_type": "LoraLoaderModelOnly",
-                "inputs": {"model": [prev, 0], "lora_name": lora_name,
+                "inputs": {"model": [prev, 0], "lora_name": lname,
                            "strength_model": strength},
             }
             wf[nxt]["inputs"]["model"] = [new_id, 0]

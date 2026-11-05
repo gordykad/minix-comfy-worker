@@ -16,6 +16,15 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /comfyui && \
     git clone --depth 1 https://github.com/leejet/ComfyUI-GGUF custom_nodes/ComfyUI-GGUF && \
     pip install --no-cache-dir -r custom_nodes/ComfyUI-GGUF/requirements.txt
 
+# Face-lock stack (IP-Adapter FaceID): the cubiq node pack plus
+# InsightFace for the reference-face embedding (CPU provider at
+# runtime; the embedding is one face, once per job).
+RUN cd /comfyui && git clone --depth 1 \
+    https://github.com/cubiq/ComfyUI_IPAdapter_plus \
+    custom_nodes/ComfyUI_IPAdapter_plus
+RUN pip install --no-cache-dir insightface==0.7.3 onnxruntime
+RUN python3 -c "import insightface, onnxruntime; print('insightface import OK')"
+
 RUN pip install --no-cache-dir runpod==1.7.9 requests
 
 # Current ComfyUI needs a modern torch: its comfy_kitchen package registers
@@ -31,10 +40,10 @@ RUN python3 -c "import torch; print('torch import OK', torch.__version__)" && \
     cd /comfyui && python3 -c "import comfy_kitchen; print('comfy-kitchen import OK')"
 
 WORKDIR /worker
-COPY handler.py workflow_api.json workflow_sdxl_api.json workflow_wan_t2v_api.json workflow_wan_i2v_api.json start.sh ./
+COPY handler.py workflow_api.json workflow_sdxl_api.json workflow_sdxl_faceid_api.json workflow_wan_t2v_api.json workflow_wan_i2v_api.json start.sh ./
 # Every workflow graph must exist and parse, or the build fails here instead
 # of the worker failing a paid job at runtime (2026-11-04: the SDXL graph
 # was never COPYed, so every SDXL job died with ENOENT after its download).
-RUN python3 -c "import json; [json.load(open(f)) for f in ('workflow_api.json', 'workflow_sdxl_api.json', 'workflow_wan_t2v_api.json', 'workflow_wan_i2v_api.json')]; print('workflow graphs OK')"
+RUN python3 -c "import json; [json.load(open(f)) for f in ('workflow_api.json', 'workflow_sdxl_api.json', 'workflow_sdxl_faceid_api.json', 'workflow_wan_t2v_api.json', 'workflow_wan_i2v_api.json')]; print('workflow graphs OK')"
 RUN chmod +x start.sh
 CMD ["/worker/start.sh"]

@@ -22,6 +22,15 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /comfyui && \
 RUN cd /comfyui && git clone --depth 1 \
     https://github.com/cubiq/ComfyUI_IPAdapter_plus \
     custom_nodes/ComfyUI_IPAdapter_plus
+# insightface 0.7.3 ships no wheel for this stack, so pip builds its
+# Cython mesh extension from source - and the CUDA runtime image has
+# no compiler. That one missing package failed every image build from
+# the face-lock merge until 2026-11-05 (the endpoint silently stayed
+# on the ticket-32 image). Toolchain lands just before the step that
+# needs it so the big earlier layers stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential python3.11-dev && \
+    rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir insightface==0.7.3 onnxruntime
 RUN python3 -c "import insightface, onnxruntime; print('insightface import OK')"
 

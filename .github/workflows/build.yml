@@ -28,6 +28,6 @@ jobs:
           push: true
           tags: |
             ghcr.io/gordykad/minix-comfy-worker:latest
-            ghcr.io/gordykad/minix-comfy-worker:v3
+            ghcr.io/gordykad/minix-comfy-worker:v4
           cache-from: type=gha
           cache-to: type=gha,mode=max

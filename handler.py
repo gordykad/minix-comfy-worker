@@ -334,6 +334,9 @@ def run_video(job_input):
             wf[nxt]["inputs"]["model"] = [new_id, 0]
 
     r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"comfy /prompt {r.status_code}: {r.text[:600]}")
     r.raise_for_status()
     prompt_id = r.json()["prompt_id"]
 
@@ -371,9 +374,13 @@ def ensure_lora(spec):
     spec: {"repo": <hf repo>, "file": <path in repo>,
            "strength_model": float, "strength_clip": float}
     Returns the cached file's basename for the LoraLoader node.
+    hf_file returns the full destination path; LoraLoader validates
+    lora_name against the bare file names in its loras folder, so the
+    basename is mandatory (the full path 400s every LoRA job).
     """
-    return hf_file(spec["repo"], spec["file"],
+    dest = hf_file(spec["repo"], spec["file"],
                    os.path.join(MODELS, "loras"))
+    return os.path.basename(dest)
 
 
 def build_sdxl_lora_workflow(ckpt_name, lora_names, prompt, negative,
@@ -544,6 +551,9 @@ def run_workflow(job_input):
         wf["5"]["inputs"]["seed"] = seed
 
     r = requests.post(COMFY + "/prompt", json={"prompt": wf}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"comfy /prompt {r.status_code}: {r.text[:600]}")
     r.raise_for_status()
     prompt_id = r.json()["prompt_id"]
 

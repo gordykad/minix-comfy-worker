@@ -469,7 +469,7 @@ def run_workflow(job_input):
     r.raise_for_status()
     prompt_id = r.json()["prompt_id"]
 
-    deadline = time.time() + 600
+    deadline = time.time() + 1200
     while time.time() < deadline:
         h = requests.get(COMFY + f"/history/{prompt_id}", timeout=15).json()
         if prompt_id in h:
@@ -488,7 +488,7 @@ def run_workflow(job_input):
                             "seed": seed}
             raise RuntimeError("workflow finished with no image output")
         time.sleep(2)
-    raise RuntimeError("generation timed out after 600s")
+    raise RuntimeError("generation timed out after 1200s")
 
 
 def handler(job):
